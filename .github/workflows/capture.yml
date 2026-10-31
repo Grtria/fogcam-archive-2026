@@ -1,4 +1,4 @@
-name: fogcam-capture
+name: capture
 on:
   schedule:
     - cron: '0 */6 * * *'
@@ -23,34 +23,43 @@ jobs:
           touch /tmp/seen
           TOTAL=0
           END=$(( $(date +%s) + 20400 ))
-          CHUNK_END=$(( $(date +%s) + 3600 ))
 
           upload() {
-            N=$(ls /tmp/chunk | wc -l)
-            [ "$N" -eq 0 ] && return
-            DAY=$(TZ=America/Los_Angeles date +%Y-%m-%d)
-            ZIP="/tmp/fogcam_$(TZ=America/Los_Angeles date +%Y-%m-%d_%H-%M-%S).zip"
-            (cd /tmp/chunk && zip -q "$ZIP" *.jpg)
-            gh release view "frames-$DAY" >/dev/null 2>&1 || gh release create "frames-$DAY" --title "$DAY" --notes "Fogcam frames for $DAY"
-            gh release upload "frames-$DAY" "$ZIP" --clobber && rm -f /tmp/chunk/*.jpg "$ZIP"
+            CUR=$(TZ=America/Los_Angeles date +%Y-%m-%d/%H)
+            for HDIR in /tmp/chunk/*/*/*/; do
+              [ -d "$HDIR" ] || continue
+              HH=$(basename "$HDIR")
+              DAY=$(basename "$(dirname "$HDIR")")
+              MON=$(basename "$(dirname "$(dirname "$HDIR")")")
+              if [ "$1" != "all" ] && [ "$DAY/$HH" = "$CUR" ]; then continue; fi
+              ls "$HDIR"*.jpg >/dev/null 2>&1 || continue
+              FIRST=$(ls "$HDIR" | head -n 1 | sed -E 's/.*_([0-9]{2}-[0-9]{2}-[0-9]{2})\.jpg/\1/')
+              ZIP="/tmp/fogcam_${DAY}_${HH}h_from-${FIRST}.zip"
+              (cd /tmp/chunk && zip -qr "$ZIP" "$MON/$DAY/$HH")
+              gh release view "frames-$DAY" >/dev/null 2>&1 || gh release create "frames-$DAY" --title "$DAY" --notes "Fogcam frames for $DAY"
+              if gh release upload "frames-$DAY" "$ZIP" --clobber; then
+                rm -rf "$HDIR" "$ZIP"
+              fi
+            done
           }
 
           while [ "$(date +%s)" -lt "$END" ]; do
-            if curl -sf --max-time 10 "https://fogcam.org/fogcam2.jpg?t=$(date +%s)" -o /tmp/f.jpg && [ -s /tmp/f.jpg ]; then
+            if curl -sf --max-time 10 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "https://fogcam.org/fogcam2.jpg?t=$(date +%s)" -o /tmp/f.jpg && [ -s /tmp/f.jpg ]; then
               H=$(sha256sum /tmp/f.jpg | cut -d' ' -f1)
               if ! grep -qx "$H" /tmp/seen; then
                 echo "$H" >> /tmp/seen
-                mv /tmp/f.jpg "/tmp/chunk/fogcam_$(TZ=America/Los_Angeles date +%Y-%m-%d_%H-%M-%S).jpg"
+                MON=$(TZ=America/Los_Angeles date +%Y-%m)
+                DAY=$(TZ=America/Los_Angeles date +%Y-%m-%d)
+                HOUR=$(TZ=America/Los_Angeles date +%H)
+                mkdir -p "/tmp/chunk/$MON/$DAY/$HOUR"
+                mv /tmp/f.jpg "/tmp/chunk/$MON/$DAY/$HOUR/fogcam_$(TZ=America/Los_Angeles date +%Y-%m-%d_%H-%M-%S).jpg"
                 TOTAL=$((TOTAL+1))
               fi
             fi
-            if [ "$(date +%s)" -ge "$CHUNK_END" ]; then
-              upload
-              CHUNK_END=$(( $(date +%s) + 3600 ))
-            fi
+            upload
             sleep 15
           done
 
           gh workflow run capture.yml
-          upload
+          upload all
           [ "$TOTAL" -gt 0 ] || { echo "no frames captured"; exit 1; }
