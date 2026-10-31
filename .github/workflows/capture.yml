@@ -1,0 +1,50 @@
+name: capture
+on:
+  schedule:
+    - cron: '*/10 13-23,0-4 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: capture
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch frame
+        run: |
+          MONTH=$(TZ=America/Los_Angeles date +%Y-%m)
+          DAY=$(TZ=America/Los_Angeles date +%Y-%m-%d)
+          STAMP=$(TZ=America/Los_Angeles date +%Y-%m-%d_%H-%M-%S)
+          touch .hashes
+          if [ -f .last_hash ]; then cat .last_hash >> .hashes; rm .last_hash; fi
+          curl -sf --max-time 20 "https://fogcam.org/fogcam2.jpg?t=$(date +%s)" -o /tmp/f.jpg && [ -s /tmp/f.jpg ] || { echo "fetch failed"; exit 1; }
+          H=$(sha256sum /tmp/f.jpg | cut -d' ' -f1)
+          if grep -qx "$H" .hashes; then
+            echo "duplicate, discarded"
+          else
+            mkdir -p "frames/$MONTH/$DAY"
+            cp /tmp/f.jpg "frames/$MONTH/$DAY/fogcam_$STAMP.jpg"
+            echo "$H" >> .hashes
+            tail -n 20000 .hashes > /tmp/h && mv /tmp/h .hashes
+          fi
+      - name: Zip finished months
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MONTH=$(TZ=America/Los_Angeles date +%Y-%m)
+          for d in frames/*/; do
+            [ -d "$d" ] || continue
+            M=$(basename "$d")
+            if [ "$M" != "$MONTH" ]; then
+              zip -qr "$M.zip" "frames/$M"
+              gh release create "frames-$M" "$M.zip" --title "$M" --notes "Fogcam frames for $M"
+              rm -rf "frames/$M" "$M.zip"
+            fi
+          done
+      - name: Commit
+        run: |
+          git config user.name capture-bot
+          git config user.email bot@users.noreply.github.com
+          git add -A
+          git diff --cached --quiet || (git commit -m frame && git push)
