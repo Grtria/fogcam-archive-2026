@@ -1,50 +1,56 @@
-name: capture
+name: fogcam-capture
 on:
   schedule:
-    - cron: '*/10 13-23,0-4 * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 permissions:
   contents: write
-concurrency: capture
+  actions: write
+concurrency:
+  group: capture
+  cancel-in-progress: false
 jobs:
   grab:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch frame
-        run: |
-          MONTH=$(TZ=America/Los_Angeles date +%Y-%m)
-          DAY=$(TZ=America/Los_Angeles date +%Y-%m-%d)
-          STAMP=$(TZ=America/Los_Angeles date +%Y-%m-%d_%H-%M-%S)
-          touch .hashes
-          if [ -f .last_hash ]; then cat .last_hash >> .hashes; rm .last_hash; fi
-          curl -sf --max-time 20 "https://fogcam.org/fogcam2.jpg?t=$(date +%s)" -o /tmp/f.jpg && [ -s /tmp/f.jpg ] || { echo "fetch failed"; exit 1; }
-          H=$(sha256sum /tmp/f.jpg | cut -d' ' -f1)
-          if grep -qx "$H" .hashes; then
-            echo "duplicate, discarded"
-          else
-            mkdir -p "frames/$MONTH/$DAY"
-            cp /tmp/f.jpg "frames/$MONTH/$DAY/fogcam_$STAMP.jpg"
-            echo "$H" >> .hashes
-            tail -n 20000 .hashes > /tmp/h && mv /tmp/h .hashes
-          fi
-      - name: Zip finished months
+      - name: Capture loop
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          MONTH=$(TZ=America/Los_Angeles date +%Y-%m)
-          for d in frames/*/; do
-            [ -d "$d" ] || continue
-            M=$(basename "$d")
-            if [ "$M" != "$MONTH" ]; then
-              zip -qr "$M.zip" "frames/$M"
-              gh release create "frames-$M" "$M.zip" --title "$M" --notes "Fogcam frames for $M"
-              rm -rf "frames/$M" "$M.zip"
+          mkdir -p /tmp/chunk
+          touch /tmp/seen
+          TOTAL=0
+          END=$(( $(date +%s) + 20400 ))
+          CHUNK_END=$(( $(date +%s) + 3600 ))
+
+          upload() {
+            N=$(ls /tmp/chunk | wc -l)
+            [ "$N" -eq 0 ] && return
+            DAY=$(TZ=America/Los_Angeles date +%Y-%m-%d)
+            ZIP="/tmp/fogcam_$(TZ=America/Los_Angeles date +%Y-%m-%d_%H-%M-%S).zip"
+            (cd /tmp/chunk && zip -q "$ZIP" *.jpg)
+            gh release view "frames-$DAY" >/dev/null 2>&1 || gh release create "frames-$DAY" --title "$DAY" --notes "Fogcam frames for $DAY"
+            gh release upload "frames-$DAY" "$ZIP" --clobber && rm -f /tmp/chunk/*.jpg "$ZIP"
+          }
+
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if curl -sf --max-time 10 "https://fogcam.org/fogcam2.jpg?t=$(date +%s)" -o /tmp/f.jpg && [ -s /tmp/f.jpg ]; then
+              H=$(sha256sum /tmp/f.jpg | cut -d' ' -f1)
+              if ! grep -qx "$H" /tmp/seen; then
+                echo "$H" >> /tmp/seen
+                mv /tmp/f.jpg "/tmp/chunk/fogcam_$(TZ=America/Los_Angeles date +%Y-%m-%d_%H-%M-%S).jpg"
+                TOTAL=$((TOTAL+1))
+              fi
             fi
+            if [ "$(date +%s)" -ge "$CHUNK_END" ]; then
+              upload
+              CHUNK_END=$(( $(date +%s) + 3600 ))
+            fi
+            sleep 15
           done
-      - name: Commit
-        run: |
-          git config user.name capture-bot
-          git config user.email bot@users.noreply.github.com
-          git add -A
-          git diff --cached --quiet || (git commit -m frame && git push)
+
+          gh workflow run capture.yml
+          upload
+          [ "$TOTAL" -gt 0 ] || { echo "no frames captured"; exit 1; }
